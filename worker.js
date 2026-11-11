@@ -50,20 +50,28 @@ async function logReq(env, a, x) {
     await env.DB.put(k, JSON.stringify({ t, api: a.name, ...x }), { expirationTtl: 604800 });
   } catch (e) { /* logging must never break a request */ }
 }
+function mkToken(f) {
+  if (f === 'agw') return 'agw_' + rnd(24);
+  const cs = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  return 'AIzaSy' + [...crypto.getRandomValues(new Uint8Array(33))].map(x => cs[x & 63]).join('');
+}
 async function getApi(env, id) { return JSON.parse(await env.DB.get('api:' + id) || 'null'); }
 const putApi = (env, a) => env.DB.put('api:' + a.id, JSON.stringify(a));
 const getMain = async env => JSON.parse(await env.DB.get('main') || 'null');
 
 async function gateway(req, env, url) {
-  const cors = { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS' };
+  const cors = { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization,content-type,x-app-name,x-goog-api-key,x-api-key,x-goog-api-client', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-max-age': '86400' };
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
   const e = (m, s) => J({ error: m }, s, cors);
-  const gm = url.pathname.match(/^\/v1beta\/models\/([^\/:]+):generateContent$/);
-  const kind = gm ? 'gemini' : url.pathname === '/v1/chat/completions' ? 'openai' : url.pathname === '/v1/generate' ? 'native' : '';
-  if (!kind) return e('Unknown endpoint. Use /v1/generate, /v1/chat/completions or /v1beta/models/MODEL:generateContent', 404);
-  if (req.method !== 'POST') return e('Use POST (not the browser address bar). Open the Integrate page for examples.', 405);
-  const t = ((req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '') || req.headers.get('x-goog-api-key') || url.searchParams.get('key') || '').trim();
-  if (!t) return e('Missing token. Send header Authorization: Bearer YOUR_TOKEN', 401);
+  const P = url.pathname;
+  const gm = P.match(/^\/v1(?:beta)?\/models\/([^\/:]+):(generateContent|streamGenerateContent|countTokens)$/);
+  const lm = P.match(/^\/v1(?:beta)?\/models(?:\/([^\/:]+))?$/);
+  const kind = gm ? 'gemini' : lm ? 'list' : P === '/v1/chat/completions' ? 'openai' : P === '/v1/generate' ? 'native' : '';
+  if (!kind) return e('Unknown endpoint. Use /v1beta/models/MODEL:generateContent, /v1/chat/completions or /v1/generate', 404);
+  const need = kind === 'list' ? 'GET' : 'POST';
+  if (req.method !== need) return e('Use ' + need + ' for this endpoint. Open the Integrate page for examples.', 405);
+  const t = ((req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '') || req.headers.get('x-goog-api-key') || req.headers.get('x-api-key') || url.searchParams.get('key') || '').trim();
+  if (!t) return e('Missing token. Send it as the API key (header x-goog-api-key, Authorization: Bearer, or ?key=).', 401);
   const id = await env.DB.get('tok:' + await sha(t));
   const a = id && await getApi(env, id);
   if (!a) return e('Invalid token. If you just created it, wait 1 minute and try again.', 401);
@@ -73,9 +81,17 @@ async function gateway(req, env, url) {
   if (st !== 'active') return done(403, 'API is ' + st);
   const app = req.headers.get('x-app-name');
   if (app && a.app && app !== a.app) return done(403, 'Application not permitted');
-  let b; try { b = await req.json(); } catch { return done(400, 'Invalid JSON body'); }
   const m = await getMain(env);
   if (!m) return done(503, 'Gateway not connected to Gemini. Open Main API and connect your key.');
+  if (kind === 'list') {
+    const names = a.model !== 'any' ? [a.model] : [...new Set([m.model, ...(m.models || [])])];
+    const item = n => ({ name: 'models/' + n, displayName: n, supportedGenerationMethods: ['generateContent', 'streamGenerateContent', 'countTokens'] });
+    if (lm[1]) return names.includes(lm[1]) ? J(item(lm[1]), 200, cors) : e('Model not found or not allowed', 404);
+    if (P.startsWith('/v1/')) return J({ object: 'list', data: names.map(n => ({ id: n, object: 'model', owned_by: 'google' })), models: names.map(item) }, 200, cors);
+    return J({ models: names.map(item) }, 200, cors);
+  }
+  let b; try { b = await req.json(); } catch { return done(400, 'Invalid JSON body'); }
+  const act = gm ? gm[2] : 'generateContent';
   let model;
   if (kind === 'native') {
     model = b.model || (a.model !== 'any' ? a.model : m.model);
@@ -83,6 +99,11 @@ async function gateway(req, env, url) {
   } else {
     const rq = kind === 'gemini' ? decodeURIComponent(gm[1]) : String(b.model || '');
     model = a.model !== 'any' ? a.model : (/^gemini-/.test(rq) ? rq : m.model);
+  }
+  const gurl = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':';
+  if (act === 'countTokens') {
+    const cr = await fetch(gurl + 'countTokens', { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': await decr(env, m.enc) }, body: JSON.stringify(b) });
+    return J(await cr.json().catch(() => ({})), cr.status, cors);
   }
   const now = Date.now(), mk = Math.floor(now / 60000), dk = new Date(now).toISOString().slice(0, 10);
   if (a.mk !== mk) { a.mk = mk; a.mc = 0; }
@@ -93,7 +114,6 @@ async function gateway(req, env, url) {
   const body = {};
   if (kind === 'gemini') Object.assign(body, b);
   else if (kind === 'openai') {
-    if (b.stream) return done(400, 'Streaming is not supported. Set stream to false.');
     const msgs = Array.isArray(b.messages) ? b.messages : [];
     const txt = c => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => (x && x.text) || '').join('') : '';
     const sys = msgs.filter(x => x.role === 'system').map(x => txt(x.content)).join('\n');
@@ -113,7 +133,7 @@ async function gateway(req, env, url) {
     if (b.generationConfig) body.generationConfig = b.generationConfig;
   }
   const key = await decr(env, m.enc);
-  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) });
+  const r = await fetch(gurl + 'generateContent', { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) });
   const d = await r.json().catch(() => ({}));
   a.requests++; a.mc++; a.dc++; a.lastUsed = now;
   if (!r.ok) { await putApi(env, a); return done(502, (d.error && d.error.message) || 'Upstream error', { model }); }
@@ -121,10 +141,23 @@ async function gateway(req, env, url) {
   a.tokens += u.totalTokenCount || 0;
   await putApi(env, a);
   await logReq(env, a, { code: 200, msg: 'OK', model, tokens: u.totalTokenCount || 0, ms: Date.now() - t0 });
-  if (kind === 'gemini') return J(d, 200, cors);
+  if (kind === 'gemini') {
+    if (act === 'streamGenerateContent') {
+      if (url.searchParams.get('alt') === 'sse') return new Response('data: ' + JSON.stringify(d) + '\r\n\r\n', { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', ...cors } });
+      return J([d], 200, cors);
+    }
+    return J(d, 200, cors);
+  }
   const text = ((d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || []).map(p => p.text || '').join('');
   const usage = { promptTokens: u.promptTokenCount || 0, completionTokens: u.candidatesTokenCount || 0, totalTokens: u.totalTokenCount || 0 };
-  if (kind === 'openai') return J({ id: 'chatcmpl-' + rnd(8), object: 'chat.completion', created: Math.floor(now / 1000), model, choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }], usage: { prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens } }, 200, cors);
+  if (kind === 'openai') {
+    const cid = 'chatcmpl-' + rnd(8), cr = Math.floor(now / 1000);
+    if (b.stream) {
+      const ch = (delta, fin) => 'data: ' + JSON.stringify({ id: cid, object: 'chat.completion.chunk', created: cr, model, choices: [{ index: 0, delta, finish_reason: fin }] }) + '\n\n';
+      return new Response(ch({ role: 'assistant', content: text }, null) + ch({}, 'stop') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', ...cors } });
+    }
+    return J({ id: cid, object: 'chat.completion', created: cr, model, choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }], usage: { prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens } }, 200, cors);
+  }
   return J({ text, model, usage }, 200, cors);
 }
 
@@ -210,8 +243,8 @@ async function admin(req, env, url) {
       const f = norm(body), ex = expiry(body);
       if (!f.name) return J({ error: 'API Name required' }, 400);
       if (!ex) return J({ error: 'Choose a valid expiry (custom date must be in the future)' }, 400);
-      const id = rnd(8), token = 'agw_' + rnd(24);
-      const a = { id, ...f, expiresAt: ex, revoked: false, requests: 0, tokens: 0, lastUsed: null, created: Date.now(), tokHash: await sha(token) };
+      const fmt = body.fmt === 'agw' ? 'agw' : 'gemini', id = rnd(8), token = mkToken(fmt);
+      const a = { id, ...f, fmt, expiresAt: ex, revoked: false, requests: 0, tokens: 0, lastUsed: null, created: Date.now(), tokHash: await sha(token) };
       await putApi(env, a); await env.DB.put('tok:' + a.tokHash, id);
       return J({ api: pub(a), token });
     }
@@ -236,7 +269,7 @@ async function admin(req, env, url) {
     }
     if (M === 'POST' && act === 'regen') {
       await env.DB.delete('tok:' + a.tokHash);
-      const token = 'agw_' + rnd(24); a.tokHash = await sha(token); a.revoked = false;
+      const token = mkToken(a.fmt || 'agw'); a.tokHash = await sha(token); a.revoked = false;
       await putApi(env, a); await env.DB.put('tok:' + a.tokHash, a.id);
       return J({ token });
     }
@@ -346,11 +379,11 @@ var mo='<option value="any"'+(e&&e.model==='any'?' selected':'')+'>Any model</op
 $('#main').innerHTML='<div class="ph"><div><h2>'+(e?'Edit API':'Create New API')+'</h2><p class="sub">Set limits, expiry and the model this token may use</p></div></div><div class="card"><div class="row"><div><label>API Name</label><input id="n" value="'+v('name','')+'"></div><div><label>Application Name</label><input id="ap" value="'+v('app','')+'" placeholder="Sent as X-App-Name header (optional)"></div>'
 +'<div><label>Expiration</label><select id="ex">'+(e?'<option value="keep">Keep current ('+esc(fd(e.expiresAt))+')</option>':'')+'<option value="1h">1 hour</option><option value="24h"'+(e?'':' selected')+'>24 hours</option><option value="7d">7 days</option><option value="30d">30 days</option><option value="custom">Custom date</option></select><input id="cu" type="datetime-local" style="display:none;margin-top:6px"></div>'
 +'<div><label>Maximum Requests (0 = unlimited)</label><input id="mr" type="number" min="0" value="'+v('maxReq',0)+'"></div><div><label>Requests Per Minute (0 = unlimited)</label><input id="rp" type="number" min="0" value="'+v('rpm',60)+'"></div><div><label>Daily Usage Limit (0 = unlimited)</label><input id="dy" type="number" min="0" value="'+v('daily',0)+'"></div>'
-+'<div><label>Allowed Gemini Model</label><select id="md">'+mo+'</select></div><div><label>Status</label><select id="en"><option value="1">Enabled</option><option value="0"'+(e&&!e.enabled?' selected':'')+'>Disabled</option></select></div></div>'
++'<div><label>Allowed Gemini Model</label><select id="md">'+mo+'</select></div><div><label>Status</label><select id="en"><option value="1">Enabled</option><option value="0"'+(e&&!e.enabled?' selected':'')+'>Disabled</option></select></div>'+(e?'':'<div><label>Token format</label><select id="tf"><option value="gemini">Gemini-style (AIza...) for apps that ask for a Gemini key</option><option value="agw">Gateway-style (agw_...)</option></select></div>')+'</div>'
 +'<div class="btns"><button class="bt p" id="sv">'+(e?'Save Changes':'Create API')+'</button>'+(e?'<button class="bt" id="cn">Cancel</button>':'')+'</div>'+(m.connected?'':'<p class="m">Tip: connect your Gemini key in "Main API" first.</p>')+'</div>';
 $('#ex').onchange=function(){$('#cu').style.display=this.value==='custom'?'block':'none'};
 if(e)$('#cn').onclick=function(){go('dash')};
-$('#sv').onclick=function(){var b={name:$('#n').value,app:$('#ap').value,exp:$('#ex').value,custom:$('#cu').value?new Date($('#cu').value).toISOString():'',maxReq:$('#mr').value,rpm:$('#rp').value,daily:$('#dy').value,model:$('#md').value,enabled:$('#en').value==='1'};
+$('#sv').onclick=function(){var b={name:$('#n').value,app:$('#ap').value,exp:$('#ex').value,custom:$('#cu').value?new Date($('#cu').value).toISOString():'',maxReq:$('#mr').value,rpm:$('#rp').value,daily:$('#dy').value,model:$('#md').value,enabled:$('#en').value==='1',fmt:$('#tf')?$('#tf').value:''};
 (e?api('/admin/apis/'+e.id,'PUT',b):api('/admin/apis','POST',b)).then(function(d){if(e){toast('Saved');go('dash')}else showTok(d.token)}).catch(fail)}}
 async function mainView(){var m=await api('/admin/main');S.main=m;
 $('#main').innerHTML='<div class="ph"><div><h2>Main API Settings</h2><p class="sub">Your Gemini key is stored encrypted on the server and never sent to the browser</p></div></div><div class="card"><p><span class="dot'+(m.connected?' on':'')+'"></span><b>'+(m.connected?'Connected':'Not connected')+'</b></p>'
@@ -368,17 +401,18 @@ async function logs(){var d=await api('/admin/logs');
 var rows=d.logs.map(function(l){var ok=l.code===200;return '<tr><td data-l="Time">'+fd(l.t)+'</td><td data-l="API"><b>'+esc(l.api)+'</b></td><td data-l="Result"><span class="tag '+(ok?'active':'revoked')+'">'+l.code+'</span></td><td data-l="Model">'+esc(l.model||'—')+'</td><td data-l="Tokens">'+(l.tokens||0)+'</td><td data-l="Speed">'+(l.ms||0)+' ms</td><td data-l="Message">'+esc(l.msg)+'</td></tr>'}).join('');
 $('#main').innerHTML='<div class="ph"><div><h2>Request Logs</h2><p class="sub">Latest 60 requests, kept for 7 days</p></div><button class="bt d" data-a="clr">Clear logs</button></div><div class="card tw"><table><thead><tr><th>Time</th><th>API</th><th>Result</th><th>Model</th><th>Tokens</th><th>Speed</th><th>Message</th></tr></thead><tbody>'+(rows||'<tr class="empty"><td colspan="7">No requests yet. Logs appear when your apps call the gateway.</td></tr>')+'</tbody></table></div>'}
 async function integ(){var u=esc(location.origin)+'/v1/generate',q='&quot;';
+var o=esc(location.origin),c0='curl -X POST '+q+o+'/v1beta/models/gemini-3.8-flash:generateContent?key=YOUR_TOKEN'+q+' -H '+q+'Content-Type: application/json'+q+' -d &#39;{'+q+'contents'+q+':[{'+q+'parts'+q+':[{'+q+'text'+q+':'+q+'Hello'+q+'}]}]}&#39;',c5=['from google import genai','client = genai.Client(api_key='+q+'YOUR_TOKEN'+q+', http_options={'+q+'base_url'+q+': '+q+o+q+'})','r = client.models.generate_content(model='+q+'gemini-3.8-flash'+q+', contents='+q+'Hello'+q+')','print(r.text)'].join('&#10;');
 var c1='curl -X POST '+u+' -H '+q+'Authorization: Bearer YOUR_TOKEN'+q+' -H '+q+'Content-Type: application/json'+q+' -d &#39;{'+q+'prompt'+q+':'+q+'Hello'+q+'}&#39;';
 var c2=['const r = await fetch('+q+u+q+', {','  method: '+q+'POST'+q+',','  headers: {','    '+q+'Authorization'+q+': '+q+'Bearer YOUR_TOKEN'+q+',','    '+q+'Content-Type'+q+': '+q+'application/json'+q+'','  },','  body: JSON.stringify({ prompt: '+q+'Hello'+q+' })','});','const data = await r.json();','console.log(data.text);'].join('&#10;');
 var c3=['import requests','r = requests.post('+q+u+q+',','    headers={'+q+'Authorization'+q+': '+q+'Bearer YOUR_TOKEN'+q+'},','    json={'+q+'prompt'+q+': '+q+'Hello'+q+'})','print(r.json()['+q+'text'+q+'])'].join('&#10;');
 var c4='{'+q+'text'+q+': '+q+'Hi! How can I help?'+q+', '+q+'model'+q+': '+q+'gemini-3.8-flash'+q+', '+q+'usage'+q+': {'+q+'totalTokens'+q+': 12}}';
 var blk=function(t,c,cp){return '<div class="card" style="margin-bottom:14px"><div class="ph" style="margin-bottom:6px"><b>'+t+'</b>'+(cp?'<button class="bt sm" data-a="cpy">Copy</button>':'')+'</div><pre>'+c+'</pre></div>'};
 $('#main').innerHTML='<div class="ph"><div><h2>Integration Guide</h2><p class="sub">Use your token from any app. Your Gemini key never leaves the server.</p></div></div>'
++'<div class="card" style="margin-bottom:14px"><span class="tg">USE IN PLACE OF GOOGLE GEMINI API</span><p class="m" style="margin:8px 0 0">In any app that asks for a <b>Gemini API key</b>: <b>1.</b> paste your token as the API key. <b>2.</b> In the same app, find a setting called Base URL, API endpoint, API host or Custom endpoint, and set it to <b>'+esc(location.origin)+'</b> (no slash at the end). Now the app works through your gateway exactly like the Google Gemini API.</p><p class="m" style="margin:10px 0 0"><b>OpenAI-style apps:</b> Base URL = '+esc(location.origin)+'/v1 and API key = your token.</p><p class="m" style="margin:10px 0 0"><b>Important:</b> if an app has no field to change the Base URL, it always talks to Google directly, and no gateway token can work in it.</p></div>'
 +'<div class="card" style="margin-bottom:14px"><span class="tg">ENDPOINT</span><code>POST '+u+'</code><p class="m" style="margin:8px 0 0">Send header <b>Authorization: Bearer YOUR_TOKEN</b>. If you set an Application Name, also send header <b>X-App-Name</b> with the same value. Body can be <b>prompt</b> (text), or <b>contents</b>, <b>system</b>, <b>generationConfig</b>, <b>model</b> (optional).</p></div>'
-+blk('cURL',c1,1)+blk('JavaScript',c2,1)+blk('Python',c3,1)+blk('Response',c4,0)
++blk('Gemini-style cURL (same as Google)',c0,1)+blk('Google Python SDK',c5,1)+blk('Simple cURL',c1,1)+blk('JavaScript',c2,1)+blk('Python',c3,1)+blk('Response',c4,0)
 +'<div class="card" style="margin-bottom:14px"><span class="tg">TEST YOUR TOKEN</span><p class="m" style="margin:8px 0 0">Paste a token and send a test message. You will see the exact reply or error.</p><label>Token</label><input id="tt" type="password" autocomplete="off" placeholder="agw_..."><label>Message</label><input id="tp" value="Hello"><div class="btns"><button class="bt p" data-a="tst">Send test</button></div><pre id="to" style="display:none"></pre></div>'
-+'<div class="card" style="margin-bottom:14px"><span class="tg">WORKS WITH EXISTING APPS</span><p class="m" style="margin:8px 0 0"><b>OpenAI-style apps:</b> Base URL = '+esc(location.origin)+'/v1 , API key = your token, endpoint /chat/completions (stream off).<br><b>Gemini-style apps:</b> Base URL = '+esc(location.origin)+' , API key = your token (sent as x-goog-api-key or ?key=), path /v1beta/models/MODEL:generateContent.</p></div>'
-+'<div class="card"><span class="tg">ERROR CODES</span><p class="m" style="margin:8px 0 0">401 invalid token · 403 disabled, revoked, expired, wrong app or model · 405 you used GET instead of POST · 429 request, rate or daily limit reached · 502 Gemini returned an error · 503 gateway not connected to Gemini</p></div>'}
++'<div class="card"><span class="tg">ERROR CODES</span><p class="m" style="margin:8px 0 0">401 invalid token · 403 disabled, revoked, expired, wrong app or model · 405 wrong method (use POST) · 429 request, rate or daily limit reached · 502 Gemini returned an error · 503 gateway not connected to Gemini</p></div>'}
 document.addEventListener('click',function(e){var t=e.target.closest('[data-a]');if(!t)return;var a=t.dataset.a,i=t.dataset.id;if(a==='go')go(t.dataset.v);else if(a==='out')out();else if(a==='edit')edit(i);else if(a==='tg')tg(i);else if(a==='rg')rg(i);else if(a==='rv')rv(i);else if(a==='dl')dl(i);else if(a==='clr'){if(confirm('Clear all logs?'))api('/admin/logs','DELETE').then(logs).catch(fail)}else if(a==='tst')tst();else if(a==='cpy'){navigator.clipboard.writeText(t.closest('.card').querySelector('pre').textContent).then(function(){toast('Copied')})}});
 boot().catch(fail);
 </script></body></html>`;
